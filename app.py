@@ -237,11 +237,58 @@ def decode_strength(situation_code: str, scoring_abbrev: str | None = None, home
     return "PP" if (away_skaters == 5 or home_skaters == 5) else "EV"
 
 
+def build_coincidental_penalty_windows(plays: list[dict]) -> list[tuple[int, int, int]]:
+    """Return list of (period, time_elapsed_start, time_elapsed_end) windows where both
+    teams had a penalty called within 2 seconds of each other (coincidental minors)."""
+    penalty_plays = [
+        p for p in plays
+        if str(p.get("typeDescKey", "")).lower() == "penalty"
+    ]
+
+    # Group penalties by (period, timeInPeriod) in seconds
+    by_time: dict[tuple[int, int], list[dict]] = defaultdict(list)
+    for p in penalty_plays:
+        period = (p.get("periodDescriptor") or {}).get("number")
+        secs = parse_clock_to_seconds(p.get("timeInPeriod", ""))
+        if period is not None and secs is not None:
+            by_time[(period, secs)].append(p)
+
+    windows = []
+    times = sorted(by_time.keys())
+    for i, key in enumerate(times):
+        period, secs = key
+        # Collect all penalties within 2 seconds across adjacent entries
+        involved = list(by_time[key])
+        for other_key in times[i + 1:]:
+            o_period, o_secs = other_key
+            if o_period != period or o_secs - secs > 2:
+                break
+            involved.extend(by_time[other_key])
+
+        teams_penalized = {p.get("details", {}).get("teamAbbrev") or p.get("teamAbbrev") for p in involved}
+        teams_penalized.discard(None)
+        if len(teams_penalized) >= 2:
+            # Window lasts for the shorter penalty duration (default 2 min = 120 secs)
+            durations = [p.get("details", {}).get("duration", 120) for p in involved]
+            min_duration = min(durations) if durations else 120
+            windows.append((period, secs, secs + min_duration))
+
+    return windows
+
+
+def is_coincidental_penalty_time(period: int, time_elapsed_secs: int, windows: list[tuple[int, int, int]]) -> bool:
+    return any(
+        w_period == period and w_start <= time_elapsed_secs <= w_end
+        for w_period, w_start, w_end in windows
+    )
+
+
 def parse_raw_events(game_data: dict) -> list[dict]:
     plays = game_data.get("plays") or []
     team_lookup = build_team_lookup(game_data)
     home_abbrev, away_abbrev = get_home_away_abbrevs(game_data)
     player_lookup = build_player_lookup(game_data)
+    coincidental_windows = build_coincidental_penalty_windows(plays)
 
     deduped = {}
     for play in plays:
@@ -266,7 +313,15 @@ def parse_raw_events(game_data: dict) -> list[dict]:
             scorer_id = details.get("scoringPlayerId")
             scorer = player_lookup.get(scorer_id, "Unknown") if scorer_id else "Unknown"
             scoring_team = safe_team(play, team_lookup)
-            strength = decode_strength(play.get("situationCode", ""), scoring_team, home_abbrev, away_abbrev)
+            goal_time_elapsed = parse_clock_to_seconds(play.get("timeInPeriod", ""))
+            if (
+                period is not None
+                and goal_time_elapsed is not None
+                and is_coincidental_penalty_time(period, goal_time_elapsed, coincidental_windows)
+            ):
+                strength = "EV"
+            else:
+                strength = decode_strength(play.get("situationCode", ""), scoring_team, home_abbrev, away_abbrev)
 
         deduped[play.get("eventId")] = {
             "event_id": play.get("eventId"),
