@@ -237,7 +237,7 @@ def decode_strength(situation_code: str, scoring_abbrev: str | None = None, home
     return "PP" if (away_skaters == 5 or home_skaters == 5) else "EV"
 
 
-def build_coincidental_penalty_windows(plays: list[dict]) -> list[tuple[int, int, int]]:
+def build_coincidental_penalty_windows(plays: list[dict], team_lookup: dict) -> list[tuple[int, int, int]]:
     """Return list of (period, time_elapsed_start, time_elapsed_end) windows where both
     teams had a penalty called within 2 seconds of each other (coincidental minors)."""
     penalty_plays = [
@@ -245,7 +245,6 @@ def build_coincidental_penalty_windows(plays: list[dict]) -> list[tuple[int, int
         if str(p.get("typeDescKey", "")).lower() == "penalty"
     ]
 
-    # Group penalties by (period, timeInPeriod) in seconds
     by_time: dict[tuple[int, int], list[dict]] = defaultdict(list)
     for p in penalty_plays:
         period = (p.get("periodDescriptor") or {}).get("number")
@@ -257,7 +256,6 @@ def build_coincidental_penalty_windows(plays: list[dict]) -> list[tuple[int, int
     times = sorted(by_time.keys())
     for i, key in enumerate(times):
         period, secs = key
-        # Collect all penalties within 2 seconds across adjacent entries
         involved = list(by_time[key])
         for other_key in times[i + 1:]:
             o_period, o_secs = other_key
@@ -265,10 +263,9 @@ def build_coincidental_penalty_windows(plays: list[dict]) -> list[tuple[int, int
                 break
             involved.extend(by_time[other_key])
 
-        teams_penalized = {p.get("details", {}).get("teamAbbrev") or p.get("teamAbbrev") for p in involved}
-        teams_penalized.discard(None)
+        teams_penalized = {safe_team(p, team_lookup) for p in involved}
+        teams_penalized.discard("UNK")
         if len(teams_penalized) >= 2:
-            # Window lasts for the shorter penalty duration (default 2 min = 120 secs)
             durations = [p.get("details", {}).get("duration", 120) for p in involved]
             min_duration = min(durations) if durations else 120
             windows.append((period, secs, secs + min_duration))
@@ -288,7 +285,7 @@ def parse_raw_events(game_data: dict) -> list[dict]:
     team_lookup = build_team_lookup(game_data)
     home_abbrev, away_abbrev = get_home_away_abbrevs(game_data)
     player_lookup = build_player_lookup(game_data)
-    coincidental_windows = build_coincidental_penalty_windows(plays)
+    coincidental_windows = build_coincidental_penalty_windows(plays, team_lookup)
 
     deduped = {}
     for play in plays:
