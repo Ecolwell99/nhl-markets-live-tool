@@ -753,7 +753,7 @@ if st.session_state.tracking:
                 st.session_state.alert_shown_until = time.time() + 7
                 for period, a in alerts:
                     st.session_state.alert_log.append({
-                        "Time": datetime.now(ZoneInfo("America/New_York")).strftime("%H:%M:%S ET"),
+                        "Time": datetime.now(ZoneInfo("America/New_York")).strftime("%I:%M:%S %p ET"),
                         "Period": period,
                         "Alert": a,
                         "Type": alert_type,
