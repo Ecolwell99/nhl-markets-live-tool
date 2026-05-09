@@ -237,47 +237,28 @@ def decode_strength(situation_code: str, scoring_abbrev: str | None = None, home
     return "PP" if (away_skaters == 5 or home_skaters == 5) else "EV"
 
 
-def build_coincidental_penalty_windows(plays: list[dict], team_lookup: dict) -> list[tuple[int, int, int]]:
-    """Return list of (period, time_elapsed_start, time_elapsed_end) windows where both
-    teams had a penalty called within 2 seconds of each other (coincidental minors)."""
-    penalty_plays = [
-        p for p in plays
-        if str(p.get("typeDescKey", "")).lower() == "penalty"
-    ]
-
-    by_time: dict[tuple[int, int], list[dict]] = defaultdict(list)
-    for p in penalty_plays:
-        period = (p.get("periodDescriptor") or {}).get("number")
-        secs = parse_clock_to_seconds(p.get("timeInPeriod", ""))
-        if period is not None and secs is not None:
-            by_time[(period, secs)].append(p)
-
-    windows = []
-    times = sorted(by_time.keys())
-    for i, key in enumerate(times):
-        period, secs = key
-        involved = list(by_time[key])
-        for other_key in times[i + 1:]:
-            o_period, o_secs = other_key
-            if o_period != period or o_secs - secs > 2:
-                break
-            involved.extend(by_time[other_key])
-
-        teams_penalized = {safe_team(p, team_lookup) for p in involved}
-        teams_penalized.discard("UNK")
-        if len(teams_penalized) >= 2:
-            durations = [p.get("details", {}).get("duration", 120) for p in involved]
-            min_duration = min(durations) if durations else 120
-            windows.append((period, secs, secs + min_duration))
-
-    return windows
+def decode_strength(situation_code: str, scoring_abbrev: str | None = None, home_abbrev: str | None = None, away_abbrev: str | None = None) -> str:
+    if not situation_code or len(situation_code) != 4:
+        return "EV"
+    away_skaters = int(situation_code[1])
+    home_skaters = int(situation_code[2])
+    away_goalie = situation_code[0] == "1"
+    home_goalie = situation_code[3] == "1"
+    if not away_goalie or not home_goalie:
+        return "EN"
+    if away_skaters == home_skaters:
+        return "EV"
+    away_has_advantage = away_skaters > home_skaters
+    if scoring_abbrev and home_abbrev and away_abbrev:
+        scoring_is_away = scoring_abbrev == away_abbrev
+        return "PP" if (away_has_advantage == scoring_is_away) else "SH"
+    return "PP" if (away_skaters == 5 or home_skaters == 5) else "EV"
 
 
-def is_coincidental_penalty_time(period: int, time_elapsed_secs: int, windows: list[tuple[int, int, int]]) -> bool:
-    return any(
-        w_period == period and w_start <= time_elapsed_secs <= w_end
-        for w_period, w_start, w_end in windows
-    )
+def is_equal_strength_code(situation_code: str) -> bool:
+    if not situation_code or len(situation_code) != 4:
+        return False
+    return situation_code[1] == situation_code[2]
 
 
 def parse_raw_events(game_data: dict) -> list[dict]:
@@ -285,7 +266,9 @@ def parse_raw_events(game_data: dict) -> list[dict]:
     team_lookup = build_team_lookup(game_data)
     home_abbrev, away_abbrev = get_home_away_abbrevs(game_data)
     player_lookup = build_player_lookup(game_data)
-    coincidental_windows = build_coincidental_penalty_windows(plays, team_lookup)
+
+    # Build index of play position so we can look up the preceding play by event index
+    play_index = {id(p): i for i, p in enumerate(plays)}
 
     deduped = {}
     for play in plays:
@@ -310,15 +293,16 @@ def parse_raw_events(game_data: dict) -> list[dict]:
             scorer_id = details.get("scoringPlayerId")
             scorer = player_lookup.get(scorer_id, "Unknown") if scorer_id else "Unknown"
             scoring_team = safe_team(play, team_lookup)
-            goal_time_elapsed = parse_clock_to_seconds(play.get("timeInPeriod", ""))
-            if (
-                period is not None
-                and goal_time_elapsed is not None
-                and is_coincidental_penalty_time(period, goal_time_elapsed, coincidental_windows)
-            ):
-                strength = "EV"
-            else:
-                strength = decode_strength(play.get("situationCode", ""), scoring_team, home_abbrev, away_abbrev)
+            goal_situation = play.get("situationCode", "")
+            # If the goal's own situation code shows unequal skaters, check the preceding
+            # play. The API sometimes stamps a goal with a stale 5v4 code when coincidental
+            # penalties brought both teams to 4v4 a moment earlier.
+            if not is_equal_strength_code(goal_situation):
+                idx = play_index.get(id(play), 0)
+                prev_code = plays[idx - 1].get("situationCode", "") if idx > 0 else ""
+                if is_equal_strength_code(prev_code) and prev_code[1] != "5":
+                    goal_situation = prev_code
+            strength = decode_strength(goal_situation, scoring_team, home_abbrev, away_abbrev)
 
         deduped[play.get("eventId")] = {
             "event_id": play.get("eventId"),
