@@ -227,25 +227,7 @@ def decode_strength(situation_code: str, scoring_abbrev: str | None = None, home
     away_goalie = situation_code[0] == "1"
     home_goalie = situation_code[3] == "1"
     if not away_goalie or not home_goalie:
-        return "EN"
-    if away_skaters == home_skaters:
         return "EV"
-    away_has_advantage = away_skaters > home_skaters
-    if scoring_abbrev and home_abbrev and away_abbrev:
-        scoring_is_away = scoring_abbrev == away_abbrev
-        return "PP" if (away_has_advantage == scoring_is_away) else "SH"
-    return "PP" if (away_skaters == 5 or home_skaters == 5) else "EV"
-
-
-def decode_strength(situation_code: str, scoring_abbrev: str | None = None, home_abbrev: str | None = None, away_abbrev: str | None = None) -> str:
-    if not situation_code or len(situation_code) != 4:
-        return "EV"
-    away_skaters = int(situation_code[1])
-    home_skaters = int(situation_code[2])
-    away_goalie = situation_code[0] == "1"
-    home_goalie = situation_code[3] == "1"
-    if not away_goalie or not home_goalie:
-        return "EN"
     if away_skaters == home_skaters:
         return "EV"
     away_has_advantage = away_skaters > home_skaters
