@@ -1,4 +1,8 @@
+import json
+import os
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import requests
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
@@ -41,6 +45,42 @@ def init_state():
         for key, value in defaults.items():
             if key not in st.session_state:
                 st.session_state[key] = value
+
+
+ALERT_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nhl_alert_logs")
+
+
+def alert_log_path(game_id: int) -> str:
+    return os.path.join(ALERT_LOG_DIR, f"game_{game_id}.json")
+
+
+def load_alert_log(game_id: int) -> list:
+    try:
+        path = alert_log_path(game_id)
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+
+def save_alert_log(game_id: int, log: list):
+    try:
+        os.makedirs(ALERT_LOG_DIR, exist_ok=True)
+        with open(alert_log_path(game_id), "w") as f:
+            json.dump(log, f)
+    except Exception:
+        pass
+
+
+def clear_alert_log(game_id: int):
+    try:
+        path = alert_log_path(game_id)
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
 
 
 class RateLimitedError(Exception):
@@ -181,20 +221,46 @@ def build_player_lookup(game_data: dict) -> dict:
     return lookup
 
 
-def decode_strength(situation_code: str) -> str:
+def decode_strength(situation_code: str, scoring_abbrev: str | None = None, home_abbrev: str | None = None, away_abbrev: str | None = None) -> str:
     if not situation_code or len(situation_code) != 4:
         return "EV"
     away_skaters = int(situation_code[1])
     home_skaters = int(situation_code[2])
     away_goalie = situation_code[0] == "1"
     home_goalie = situation_code[3] == "1"
-    if not away_goalie or not home_goalie:
-        return "EN"
+
     if away_skaters == home_skaters:
         return "EV"
-    if away_skaters > home_skaters:
-        return "PP" if away_skaters == 5 else "SH"
-    return "PP" if home_skaters == 5 else "SH"
+
+    away_has_advantage = away_skaters > home_skaters
+
+    if scoring_abbrev and home_abbrev and away_abbrev:
+        scoring_is_away = scoring_abbrev == away_abbrev
+        scoring_goalie_pulled = (scoring_is_away and not away_goalie) or (not scoring_is_away and not home_goalie)
+
+        if scoring_goalie_pulled:
+            scoring_skaters = away_skaters if scoring_is_away else home_skaters
+            other_skaters = home_skaters if scoring_is_away else away_skaters
+            # Advantage of exactly 1 = the pulled goalie is the extra attacker = EV (delayed penalty)
+            # Advantage of 2+ = pre-existing PP with goalie also pulled = PP (e.g. 6v4)
+            return "EV" if (scoring_skaters - other_skaters) == 1 else "PP"
+
+        # Opposing team pulled goalie, scoring team did not = EN, treat as EV
+        if not away_goalie or not home_goalie:
+            return "EV"
+
+        return "PP" if (away_has_advantage == scoring_is_away) else "SH"
+
+    # Fallback without team info
+    if not away_goalie or not home_goalie:
+        return "EV"
+    return "PP" if (away_skaters == 5 or home_skaters == 5) else "EV"
+
+
+def is_equal_strength_code(situation_code: str) -> bool:
+    if not situation_code or len(situation_code) != 4:
+        return False
+    return situation_code[1] == situation_code[2]
 
 
 def parse_raw_events(game_data: dict) -> list[dict]:
@@ -202,6 +268,9 @@ def parse_raw_events(game_data: dict) -> list[dict]:
     team_lookup = build_team_lookup(game_data)
     home_abbrev, away_abbrev = get_home_away_abbrevs(game_data)
     player_lookup = build_player_lookup(game_data)
+
+    # Build index of play position so we can look up the preceding play by event index
+    play_index = {id(p): i for i, p in enumerate(plays)}
 
     deduped = {}
     for play in plays:
@@ -225,7 +294,17 @@ def parse_raw_events(game_data: dict) -> list[dict]:
         if display_type == "GOAL":
             scorer_id = details.get("scoringPlayerId")
             scorer = player_lookup.get(scorer_id, "Unknown") if scorer_id else "Unknown"
-            strength = decode_strength(play.get("situationCode", ""))
+            scoring_team = safe_team(play, team_lookup)
+            goal_situation = play.get("situationCode", "")
+            # If the goal's own situation code shows unequal skaters, check the preceding
+            # play. The API sometimes stamps a goal with a stale 5v4 code when coincidental
+            # penalties brought both teams to 4v4 a moment earlier.
+            if not is_equal_strength_code(goal_situation):
+                idx = play_index.get(id(play), 0)
+                prev_code = plays[idx - 1].get("situationCode", "") if idx > 0 else ""
+                if is_equal_strength_code(prev_code) and prev_code[1] != "5":
+                    goal_situation = prev_code
+            strength = decode_strength(goal_situation, scoring_team, home_abbrev, away_abbrev)
 
         deduped[play.get("eventId")] = {
             "event_id": play.get("eventId"),
@@ -576,6 +655,7 @@ with st.sidebar:
             st.session_state.previous_sog_event_ids = {}
             st.session_state.warning_message = "STATUS: OK"
             st.session_state.warning_type = "ok"
+            st.session_state.alert_log = load_alert_log(st.session_state.selected_game_id)
 
     label = "Newest First: ON" if st.session_state.filter_recent else "Newest First: OFF"
     if st.button(label, use_container_width=True):
@@ -596,6 +676,7 @@ if st.session_state.tracking:
         if log:
             if st.button("Clear Log", key="clear_log"):
                 st.session_state.alert_log = []
+                clear_alert_log(st.session_state.selected_game_id)
                 st.rerun()
             for entry in reversed(log):
                 color = "#ff9900" if entry["Type"] == "alert" else "#66ff99"
@@ -604,7 +685,8 @@ if st.session_state.tracking:
                     f'background-color:var(--secondary-background-color); border-left:4px solid {color}; '
                     f'font-size:15px; color:var(--text-color);">'
                     f'<span style="font-weight:700; color:{color};">P{entry["Period"]}</span>'
-                    f'&nbsp;&nbsp;{entry["Alert"]}</div>',
+                    f'&nbsp;&nbsp;{entry["Alert"]}'
+                    f'<span style="float:right; font-size:12px; opacity:0.55;">{entry.get("Time", "")}</span></div>',
                     unsafe_allow_html=True,
                 )
         else:
@@ -671,11 +753,12 @@ if st.session_state.tracking:
                 st.session_state.alert_shown_until = time.time() + 7
                 for period, a in alerts:
                     st.session_state.alert_log.append({
-                        "Time": time.strftime("%H:%M:%S"),
+                        "Time": datetime.now(ZoneInfo("America/New_York")).strftime("%I:%M:%S %p ET"),
                         "Period": period,
                         "Alert": a,
                         "Type": alert_type,
                     })
+                save_alert_log(st.session_state.selected_game_id, st.session_state.alert_log)
             elif time.time() >= st.session_state.alert_shown_until:
                 st.session_state.warning_message = "STATUS: OK"
                 st.session_state.warning_type = "ok"
