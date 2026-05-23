@@ -1,4 +1,8 @@
+import json
+import os
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import requests
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
@@ -14,6 +18,8 @@ SHOT_TYPES = {"shot-on-goal", "goal"}
 st.set_page_config(page_title="NHL Markets Dev Tool", layout="wide")
 
 
+STATE_VERSION = 2
+
 def init_state():
     defaults = {
         "games": [],
@@ -28,16 +34,63 @@ def init_state():
         "warning_type": "ok",
         "alert_shown_until": 0.0,
         "alert_log": [],
-        "filter_recent": False,
-        "color_mode": False,
+        "filter_recent": True,
+        "color_mode": True,
     }
-    for key, value in defaults.items():
-        if key not in st.session_state:
+    if st.session_state.get("_state_version") != STATE_VERSION:
+        for key, value in defaults.items():
             st.session_state[key] = value
+        st.session_state["_state_version"] = STATE_VERSION
+    else:
+        for key, value in defaults.items():
+            if key not in st.session_state:
+                st.session_state[key] = value
+
+
+ALERT_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nhl_alert_logs")
+
+
+def alert_log_path(game_id: int) -> str:
+    return os.path.join(ALERT_LOG_DIR, f"game_{game_id}.json")
+
+
+def load_alert_log(game_id: int) -> list:
+    try:
+        path = alert_log_path(game_id)
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+
+def save_alert_log(game_id: int, log: list):
+    try:
+        os.makedirs(ALERT_LOG_DIR, exist_ok=True)
+        with open(alert_log_path(game_id), "w") as f:
+            json.dump(log, f)
+    except Exception:
+        pass
+
+
+def clear_alert_log(game_id: int):
+    try:
+        path = alert_log_path(game_id)
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+class RateLimitedError(Exception):
+    pass
 
 
 def fetch_json(url: str) -> dict:
     response = requests.get(url, timeout=10)
+    if response.status_code == 429:
+        raise RateLimitedError("Rate limited by NHL API (429)")
     response.raise_for_status()
     return response.json()
 
@@ -155,10 +208,69 @@ def label_home_away(team: str, home_abbrev: str, away_abbrev: str) -> str:
     return team
 
 
+def build_player_lookup(game_data: dict) -> dict:
+    lookup = {}
+    for spot in game_data.get("rosterSpots") or []:
+        pid = spot.get("playerId")
+        if pid:
+            first = spot.get("firstName") or {}
+            last = spot.get("lastName") or {}
+            first_str = first.get("default", "") if isinstance(first, dict) else str(first)
+            last_str = last.get("default", "") if isinstance(last, dict) else str(last)
+            lookup[pid] = f"{first_str} {last_str}".strip()
+    return lookup
+
+
+def decode_strength(situation_code: str, scoring_abbrev: str | None = None, home_abbrev: str | None = None, away_abbrev: str | None = None) -> str:
+    if not situation_code or len(situation_code) != 4:
+        return "EV"
+    away_skaters = int(situation_code[1])
+    home_skaters = int(situation_code[2])
+    away_goalie = situation_code[0] == "1"
+    home_goalie = situation_code[3] == "1"
+
+    if away_skaters == home_skaters:
+        return "EV"
+
+    away_has_advantage = away_skaters > home_skaters
+
+    if scoring_abbrev and home_abbrev and away_abbrev:
+        scoring_is_away = scoring_abbrev == away_abbrev
+        scoring_goalie_pulled = (scoring_is_away and not away_goalie) or (not scoring_is_away and not home_goalie)
+
+        if scoring_goalie_pulled:
+            scoring_skaters = away_skaters if scoring_is_away else home_skaters
+            other_skaters = home_skaters if scoring_is_away else away_skaters
+            # Advantage of exactly 1 = the pulled goalie is the extra attacker = EV (delayed penalty)
+            # Advantage of 2+ = pre-existing PP with goalie also pulled = PP (e.g. 6v4)
+            return "EV" if (scoring_skaters - other_skaters) == 1 else "PP"
+
+        # Opposing team pulled goalie, scoring team did not = EN, treat as EV
+        if not away_goalie or not home_goalie:
+            return "EV"
+
+        return "PP" if (away_has_advantage == scoring_is_away) else "SH"
+
+    # Fallback without team info
+    if not away_goalie or not home_goalie:
+        return "EV"
+    return "PP" if (away_skaters == 5 or home_skaters == 5) else "EV"
+
+
+def is_equal_strength_code(situation_code: str) -> bool:
+    if not situation_code or len(situation_code) != 4:
+        return False
+    return situation_code[1] == situation_code[2]
+
+
 def parse_raw_events(game_data: dict) -> list[dict]:
     plays = game_data.get("plays") or []
     team_lookup = build_team_lookup(game_data)
     home_abbrev, away_abbrev = get_home_away_abbrevs(game_data)
+    player_lookup = build_player_lookup(game_data)
+
+    # Build index of play position so we can look up the preceding play by event index
+    play_index = {id(p): i for i, p in enumerate(plays)}
 
     deduped = {}
     for play in plays:
@@ -175,6 +287,24 @@ def parse_raw_events(game_data: dict) -> list[dict]:
 
         team = label_home_away(safe_team(play, team_lookup), home_abbrev, away_abbrev)
         period = (play.get("periodDescriptor") or {}).get("number")
+        details = play.get("details") or {}
+
+        scorer = None
+        strength = None
+        if display_type == "GOAL":
+            scorer_id = details.get("scoringPlayerId")
+            scorer = player_lookup.get(scorer_id, "Unknown") if scorer_id else "Unknown"
+            scoring_team = safe_team(play, team_lookup)
+            goal_situation = play.get("situationCode", "")
+            # If the goal's own situation code shows unequal skaters, check the preceding
+            # play. The API sometimes stamps a goal with a stale 5v4 code when coincidental
+            # penalties brought both teams to 4v4 a moment earlier.
+            if not is_equal_strength_code(goal_situation):
+                idx = play_index.get(id(play), 0)
+                prev_code = plays[idx - 1].get("situationCode", "") if idx > 0 else ""
+                if is_equal_strength_code(prev_code) and prev_code[1] != "5":
+                    goal_situation = prev_code
+            strength = decode_strength(goal_situation, scoring_team, home_abbrev, away_abbrev)
 
         deduped[play.get("eventId")] = {
             "event_id": play.get("eventId"),
@@ -186,6 +316,8 @@ def parse_raw_events(game_data: dict) -> list[dict]:
             "team": team,
             "raw_type": play_type,
             "display_type": display_type,
+            "scorer": scorer,
+            "strength": strength,
         }
 
     return list(deduped.values())
@@ -251,7 +383,22 @@ def get_game_state(game_id: int) -> dict:
         "away_label": f"{away_abbrev} (Away)",
         "clock_secs": clock_secs,
         "in_intermission": in_intermission,
+        "goals": [e for e in events if e["display_type"] == "GOAL"],
     }
+
+
+def build_goal_log(period_events: list[dict]) -> list[dict]:
+    results = []
+    for e in period_events:
+        if e["display_type"] != "GOAL":
+            continue
+        results.append({
+            "Time": e["time_remaining"],
+            "Team": e["team"],
+            "Scorer": e["scorer"] or "Unknown",
+            "Strength": e["strength"] or "EV",
+        })
+    return results
 
 
 def bucket_for_sog(event: dict) -> str | None:
@@ -358,11 +505,51 @@ TEAM_COLORS = {
     "WPG": "#041E42",
 }
 
+# Secondary / alternate colors used when two teams' primaries are too similar
+TEAM_ALT_COLORS = {
+    "ANA": "#B9975B", "ARI": "#E2D6B5", "BOS": "#000000", "BUF": "#FCB514",
+    "CAR": "#888888", "CBJ": "#CE1126", "CGY": "#F4901E", "CHI": "#000000",
+    "COL": "#236192", "DAL": "#A2AAAD", "DET": "#FFFFFF", "EDM": "#003C7F",
+    "FLA": "#041E42", "LAK": "#A2AAAD", "MIN": "#DDCBA4", "MTL": "#003DA5",
+    "NJD": "#000000", "NSH": "#041E42", "NYI": "#F47D30", "NYR": "#CE1126",
+    "OTT": "#000000", "PHI": "#000000", "PIT": "#000000", "SEA": "#001628",
+    "SJS": "#000000", "STL": "#FCB514", "TBL": "#FFFFFF", "TOR": "#FFFFFF",
+    "UTA": "#010101", "VAN": "#008852", "VGK": "#333F48", "WSH": "#041E42",
+    "WPG": "#AC162C",
+}
 
-def team_color_for(cell_value: str) -> str | None:
-    for abbrev, color in TEAM_COLORS.items():
+COLOR_DISTANCE_THRESHOLD = 60
+
+
+def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+    h = hex_color.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _color_distance(a: str, b: str) -> float:
+    r1, g1, b1 = _hex_to_rgb(a)
+    r2, g2, b2 = _hex_to_rgb(b)
+    return ((r1 - r2) ** 2 + (g1 - g2) ** 2 + (b1 - b2) ** 2) ** 0.5
+
+
+def resolve_team_colors(home_abbrev: str, away_abbrev: str) -> dict[str, str]:
+    home_color = TEAM_COLORS.get(home_abbrev, "#888888")
+    away_color = TEAM_COLORS.get(away_abbrev, "#888888")
+    if _color_distance(home_color, away_color) < COLOR_DISTANCE_THRESHOLD:
+        away_color = TEAM_ALT_COLORS.get(away_abbrev, away_color)
+    return {home_abbrev: home_color, away_abbrev: away_color}
+
+
+def team_color_for(cell_value: str, team_color_map: dict[str, str] | None = None) -> str | None:
+    source = team_color_map if team_color_map else TEAM_COLORS
+    for abbrev, color in source.items():
         if abbrev in cell_value:
             return color
+    # Fall back to full TEAM_COLORS if map was provided but didn't match
+    if team_color_map:
+        for abbrev, color in TEAM_COLORS.items():
+            if abbrev in cell_value:
+                return color
     return None
 
 
@@ -373,7 +560,7 @@ def pill_text_color(bg_hex: str) -> str:
     return "#000" if luminance > 0.5 else "#fff"
 
 
-def html_table(rows: list[dict], color_mode: bool = False) -> str:
+def html_table(rows: list[dict], color_mode: bool = False, team_color_map: dict[str, str] | None = None) -> str:
     if not rows:
         return ""
     headers = list(rows[0].keys())
@@ -394,7 +581,7 @@ def html_table(rows: list[dict], color_mode: bool = False) -> str:
                 elif val == "NO":
                     display = f'<span style="background-color:#cc2200; color:#fff; padding:2px 10px; border-radius:12px; font-weight:700; font-size:12px;">NO</span>'
                 else:
-                    team_color = team_color_for(str(val))
+                    team_color = team_color_for(str(val), team_color_map)
                     if team_color:
                         text_color = pill_text_color(team_color)
                         display = f'<span style="background-color:{team_color}; color:{text_color}; padding:2px 10px; border-radius:12px; font-weight:700; font-size:12px;">{val}</span>'
@@ -435,13 +622,6 @@ init_state()
 st.markdown(
     """
     <style>
-    [data-testid="column"] {
-        min-width: 320px;
-        flex: 1 1 320px;
-    }
-    [data-testid="stHorizontalBlock"] {
-        flex-wrap: wrap;
-    }
     .ag-row-selected .ag-cell {
         background-color: rgba(255, 153, 0, 0.2) !important;
     }
@@ -515,6 +695,7 @@ with st.sidebar:
             st.session_state.previous_sog_event_ids = {}
             st.session_state.warning_message = "STATUS: OK"
             st.session_state.warning_type = "ok"
+            st.session_state.alert_log = load_alert_log(st.session_state.selected_game_id)
 
     label = "Newest First: ON" if st.session_state.filter_recent else "Newest First: OFF"
     if st.button(label, use_container_width=True):
@@ -535,6 +716,7 @@ if st.session_state.tracking:
         if log:
             if st.button("Clear Log", key="clear_log"):
                 st.session_state.alert_log = []
+                clear_alert_log(st.session_state.selected_game_id)
                 st.rerun()
             for entry in reversed(log):
                 color = "#ff9900" if entry["Type"] == "alert" else "#66ff99"
@@ -543,7 +725,8 @@ if st.session_state.tracking:
                     f'background-color:var(--secondary-background-color); border-left:4px solid {color}; '
                     f'font-size:15px; color:var(--text-color);">'
                     f'<span style="font-weight:700; color:{color};">P{entry["Period"]}</span>'
-                    f'&nbsp;&nbsp;{entry["Alert"]}</div>',
+                    f'&nbsp;&nbsp;{entry["Alert"]}'
+                    f'<span style="float:right; font-size:12px; opacity:0.55;">{entry.get("Time", "")}</span></div>',
                     unsafe_allow_html=True,
                 )
         else:
@@ -568,50 +751,54 @@ if st.session_state.tracking:
             prev_sog_ids = st.session_state.previous_sog_event_ids
 
             alerts = []
+            is_first_tick = previous_live_period is None
 
-            if previous_live_period == live_period:
-                if previous_faceoff_count is not None:
-                    delta = live_period_faceoff_count - previous_faceoff_count
-                    if delta < 0:
-                        alerts.append(f"FACEOFF COUNT DECREASE: {previous_faceoff_count} → {live_period_faceoff_count}")
-                    elif delta > 1:
-                        alerts.append(f"MULTIPLE FACEOFFS ADDED: +{delta}")
+            if not is_first_tick:
+                if previous_live_period == live_period:
+                    if previous_faceoff_count is not None:
+                        delta = live_period_faceoff_count - previous_faceoff_count
+                        if delta < 0:
+                            alerts.append((live_period, f"FACEOFF COUNT DECREASE: {previous_faceoff_count} → {live_period_faceoff_count}"))
+                        elif delta > 1:
+                            alerts.append((live_period, f"MULTIPLE FACEOFFS ADDED: +{delta}"))
 
-                for eid, (period, fo_num, team) in current_faceoff_teams.items():
-                    if eid in prev_faceoff_teams:
-                        _, _, prev_team = prev_faceoff_teams[eid]
-                        if prev_team != team:
-                            alerts.append(f"FACEOFF TEAM CHANGED: P{period} Faceoff #{fo_num} — {prev_team} → {team}")
+                    for eid, (period, fo_num, team) in current_faceoff_teams.items():
+                        if eid in prev_faceoff_teams:
+                            _, _, prev_team = prev_faceoff_teams[eid]
+                            if prev_team != team:
+                                alerts.append((period, f"FACEOFF TEAM CHANGED: P{period} Faceoff #{fo_num} — {prev_team} → {team}"))
 
-                for eid in prev_sog_ids:
-                    if eid not in current_sog_ids:
-                        prev_event = prev_sog_ids[eid] if isinstance(prev_sog_ids, dict) else None
-                        if prev_event:
-                            bucket = bucket_for_sog(prev_event)
-                            bucket_str = f" (bucket {bucket})" if bucket else ""
-                            alerts.append(
-                                f"SOG REMOVED: P{prev_event['period']} {prev_event['time_remaining']} "
-                                f"{prev_event['team']}{bucket_str}"
-                            )
-                        else:
-                            alerts.append(f"SOG REMOVED: event {eid}")
-            else:
-                alerts.append(f"Period {live_period} started")
+                    for eid in prev_sog_ids:
+                        if eid not in current_sog_ids:
+                            prev_event = prev_sog_ids[eid] if isinstance(prev_sog_ids, dict) else None
+                            if prev_event:
+                                bucket = bucket_for_sog(prev_event)
+                                bucket_str = f" (bucket {bucket})" if bucket else ""
+                                alerts.append((
+                                    prev_event["period"],
+                                    f"SOG REMOVED: P{prev_event['period']} {prev_event['time_remaining']} "
+                                    f"{prev_event['team']}{bucket_str}"
+                                ))
+                            else:
+                                alerts.append((live_period, f"SOG REMOVED: event {eid}"))
+                else:
+                    alerts.append((live_period, f"Period {live_period} started"))
 
             if alerts:
                 period_changed = previous_live_period != live_period
                 alert_type = "ok" if period_changed else "alert"
-                msg = " | ".join(f"⚠ {a}" for a in alerts)
+                msg = " | ".join(f"⚠ {a}" for _, a in alerts)
                 st.session_state.warning_message = msg
                 st.session_state.warning_type = alert_type
                 st.session_state.alert_shown_until = time.time() + 7
-                for a in alerts:
+                for period, a in alerts:
                     st.session_state.alert_log.append({
-                        "Time": time.strftime("%H:%M:%S"),
-                        "Period": live_period,
+                        "Time": datetime.now(ZoneInfo("America/New_York")).strftime("%I:%M:%S %p ET"),
+                        "Period": period,
                         "Alert": a,
                         "Type": alert_type,
                     })
+                save_alert_log(st.session_state.selected_game_id, st.session_state.alert_log)
             elif time.time() >= st.session_state.alert_shown_until:
                 st.session_state.warning_message = "STATUS: OK"
                 st.session_state.warning_type = "ok"
@@ -623,24 +810,16 @@ if st.session_state.tracking:
 
             warning_box(st.session_state.warning_message, st.session_state.warning_type)
 
-            hero_left, hero_right = st.columns([1, 3])
-            with hero_left:
+            st.markdown(
+                f"<div style='text-align:center; font-size:22px; font-weight:600; opacity:0.6; margin-bottom:4px;'>P{live_period} LIVE FACEOFFS</div>"
+                f"<div style='text-align:center; font-size:80px; font-weight:700; line-height:1;'>{live_period_faceoff_count}</div>",
+                unsafe_allow_html=True,
+            )
+            if lf := state["last_faceoff"]:
                 st.markdown(
-                    f"<div style='text-align:center; font-size:22px; font-weight:600; opacity:0.6; margin-bottom:4px;'>PERIOD</div>"
-                    f"<div style='text-align:center; font-size:60px; font-weight:700; line-height:1;'>{live_period}</div>",
+                    f"<div style='text-align:center; font-size:13px; opacity:0.6;'>Last — P{lf['period']} {lf['time_remaining']} | {lf['team']} | #{lf['faceoff_number']}</div>",
                     unsafe_allow_html=True,
                 )
-            with hero_right:
-                st.markdown(
-                    f"<div style='text-align:center; font-size:22px; font-weight:600; opacity:0.6; margin-bottom:4px;'>LIVE FACEOFFS</div>"
-                    f"<div style='text-align:center; font-size:80px; font-weight:700; line-height:1;'>{live_period_faceoff_count}</div>",
-                    unsafe_allow_html=True,
-                )
-                if lf := state["last_faceoff"]:
-                    st.markdown(
-                        f"<div style='text-align:center; font-size:13px; opacity:0.6;'>Last — P{lf['period']} {lf['time_remaining']} | {lf['team']} | #{lf['faceoff_number']}</div>",
-                        unsafe_allow_html=True,
-                    )
 
             st.divider()
 
@@ -655,38 +834,56 @@ if st.session_state.tracking:
             period_events = [e for e in state["events"] if e["period"] == selected_period]
             period_faceoffs = [e for e in period_events if e["display_type"] == "FACEOFF"]
 
-            left, right = st.columns(2)
+            team_color_map = resolve_team_colors(state["home_abbrev"], state["away_abbrev"])
 
-            with left:
-                st.subheader(f"P{selected_period} — First Shot After Faceoff")
-                rows = build_first_sog_after_faceoff(period_faceoffs, period_events, state["events"])
-                if rows:
-                    if st.session_state.filter_recent:
-                        rows = list(reversed(rows))
-                    st.markdown(html_table(rows, st.session_state.color_mode), unsafe_allow_html=True)
-                else:
-                    st.info("No faceoffs found in this period.")
+            home_sog = sum(1 for e in period_events if e["display_type"] in {"SOG", "GOAL"} and e["team"] == state["home_label"])
+            away_sog = sum(1 for e in period_events if e["display_type"] in {"SOG", "GOAL"} and e["team"] == state["away_label"])
+            st.markdown(f"<div style='text-align:center; font-weight:700; font-size:22px;'>SOG — {state['away_label']}: {away_sog} | {state['home_label']}: {home_sog}</div>", unsafe_allow_html=True)
 
-            with right:
-                st.subheader(f"P{selected_period} — 2-Min SOG Buckets")
-                period_finished = selected_period < live_period or (selected_period == live_period and state["in_intermission"])
-                bucket_results = build_two_minute_buckets(
-                    period_events, state["home_label"], state["away_label"],
-                    period_finished=period_finished,
-                    clock_secs=state["clock_secs"] if selected_period == live_period else None,
-                )
-                rows = [
-                    {
-                        "Window": b["window"],
-                        state["away_label"]: b["away_result"],
-                        state["home_label"]: b["home_result"],
-                    }
-                    for b in bucket_results
-                ]
+            st.markdown(f"<div style='text-align:left; font-size:20px; font-weight:400; margin-top:16px;'>P{selected_period} — First Shot After Faceoff</div>", unsafe_allow_html=True)
+            rows = build_first_sog_after_faceoff(period_faceoffs, period_events, state["events"])
+            if rows:
                 if st.session_state.filter_recent:
                     rows = list(reversed(rows))
-                st.markdown(html_table(rows, st.session_state.color_mode), unsafe_allow_html=True)
+                st.markdown(html_table(rows, st.session_state.color_mode, team_color_map), unsafe_allow_html=True)
+            else:
+                st.info("No faceoffs found in this period.")
 
+            st.markdown(f"<div style='text-align:left; font-size:20px; font-weight:400; margin-top:16px;'>P{selected_period} — 2-Min SOG Buckets</div>", unsafe_allow_html=True)
+            period_finished = selected_period < live_period or (selected_period == live_period and state["in_intermission"])
+            bucket_results = build_two_minute_buckets(
+                period_events, state["home_label"], state["away_label"],
+                period_finished=period_finished,
+                clock_secs=state["clock_secs"] if selected_period == live_period else None,
+            )
+            rows = [
+                {
+                    "Window": b["window"],
+                    state["away_label"]: b["away_result"],
+                    state["home_label"]: b["home_result"],
+                }
+                for b in bucket_results
+            ]
+            if st.session_state.filter_recent:
+                rows = list(reversed(rows))
+            st.markdown(html_table(rows, st.session_state.color_mode, team_color_map), unsafe_allow_html=True)
+
+            st.divider()
+            st.markdown(f"<div style='text-align:left; font-size:20px; font-weight:400; margin-top:16px;'>P{selected_period} — Goals</div>", unsafe_allow_html=True)
+            goal_rows = build_goal_log(period_events)
+            if goal_rows:
+                if st.session_state.filter_recent:
+                    goal_rows = list(reversed(goal_rows))
+                st.markdown(html_table(goal_rows, st.session_state.color_mode, team_color_map), unsafe_allow_html=True)
+            else:
+                st.info("No goals this period.")
+
+
+        except RateLimitedError:
+            st.session_state.warning_message = "⚠ RATE LIMITED — retrying next tick"
+            st.session_state.warning_type = "alert"
+            st.session_state.alert_shown_until = time.time() + 15
+            warning_box(st.session_state.warning_message, st.session_state.warning_type)
         except Exception as e:
             st.error(f"Refresh error: {e}")
 else:
