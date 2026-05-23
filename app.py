@@ -518,7 +518,7 @@ TEAM_ALT_COLORS = {
     "WPG": "#AC162C",
 }
 
-COLOR_DISTANCE_THRESHOLD = 60
+COLOR_DISTANCE_THRESHOLD = 100
 
 
 def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
