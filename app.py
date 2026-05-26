@@ -10,8 +10,8 @@ from collections import defaultdict
 
 SCOREBOARD_URL = "https://api-web.nhle.com/v1/scoreboard/now"
 PBP_URL = "https://api-web.nhle.com/v1/gamecenter/{game_id}/play-by-play"
-REFRESH_MS = 5000
-RATE_LIMIT_SKIP_TICKS = 6  # ~30s cooldown after a 429
+REFRESH_MS = 3000
+RATE_LIMIT_SKIP_TICKS = 1
 
 FACEOFF_TYPE = "faceoff"
 SHOT_TYPES = {"shot-on-goal", "goal"}
@@ -97,6 +97,16 @@ def fetch_json(url: str) -> dict:
     return response.json()
 
 
+@st.cache_data(ttl=10, show_spinner=False)
+def fetch_scoreboard() -> dict:
+    return fetch_json(SCOREBOARD_URL)
+
+
+@st.cache_data(ttl=1.5, show_spinner=False)
+def fetch_pbp(game_id: int) -> dict:
+    return fetch_json(PBP_URL.format(game_id=game_id))
+
+
 def extract_abbrev(value, fallback="UNK"):
     if isinstance(value, str) and value:
         return value
@@ -110,7 +120,7 @@ def extract_abbrev(value, fallback="UNK"):
 
 
 def load_live_games():
-    data = fetch_json(SCOREBOARD_URL)
+    data = fetch_scoreboard()
     games = []
     for day in data.get("gamesByDate", []):
         for game in day.get("games", []):
@@ -347,7 +357,7 @@ def add_period_local_numbers(events: list[dict]) -> list[dict]:
 
 
 def get_game_state(game_id: int) -> dict:
-    data = fetch_json(PBP_URL.format(game_id=game_id))
+    data = fetch_pbp(game_id)
     events = add_period_local_numbers(parse_raw_events(data))
 
     faceoffs = [e for e in events if e["display_type"] == "FACEOFF"]
@@ -889,7 +899,7 @@ if st.session_state.tracking:
 
         except RateLimitedError:
             st.session_state.rate_limit_skip_remaining = RATE_LIMIT_SKIP_TICKS
-            st.session_state.warning_message = "⚠ RATE LIMITED — retrying next tick"
+            st.session_state.warning_message = "⚠ RATE LIMITED — brief cooldown"
             st.session_state.warning_type = "alert"
             st.session_state.alert_shown_until = time.time() + 15
             warning_box(st.session_state.warning_message, st.session_state.warning_type)
