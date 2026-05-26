@@ -10,7 +10,8 @@ from collections import defaultdict
 
 SCOREBOARD_URL = "https://api-web.nhle.com/v1/scoreboard/now"
 PBP_URL = "https://api-web.nhle.com/v1/gamecenter/{game_id}/play-by-play"
-REFRESH_MS = 3000
+REFRESH_MS = 5000
+RATE_LIMIT_SKIP_TICKS = 6  # ~30s cooldown after a 429
 
 FACEOFF_TYPE = "faceoff"
 SHOT_TYPES = {"shot-on-goal", "goal"}
@@ -36,6 +37,7 @@ def init_state():
         "alert_log": [],
         "filter_recent": True,
         "color_mode": True,
+        "rate_limit_skip_remaining": 0,
     }
     if st.session_state.get("_state_version") != STATE_VERSION:
         for key, value in defaults.items():
@@ -733,6 +735,12 @@ if st.session_state.tracking:
             st.info("No alerts recorded yet.")
 
     with tab_main:
+        if st.session_state.rate_limit_skip_remaining > 0:
+            st.session_state.rate_limit_skip_remaining -= 1
+            secs_left = st.session_state.rate_limit_skip_remaining * (REFRESH_MS // 1000)
+            warning_box(f"⚠ RATE LIMITED — resuming in ~{secs_left}s", "alert")
+            st.stop()
+
         try:
             state = get_game_state(st.session_state.selected_game_id)
 
@@ -880,6 +888,7 @@ if st.session_state.tracking:
 
 
         except RateLimitedError:
+            st.session_state.rate_limit_skip_remaining = RATE_LIMIT_SKIP_TICKS
             st.session_state.warning_message = "⚠ RATE LIMITED — retrying next tick"
             st.session_state.warning_type = "alert"
             st.session_state.alert_shown_until = time.time() + 15
