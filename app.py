@@ -648,7 +648,6 @@ st.markdown(
 # Sidebar: controls
 with st.sidebar:
     st.title("NHL Markets")
-    st.caption("Dev / review tool only. Do not result off this tool.")
     st.divider()
 
     if st.button("Load Live Games", use_container_width=True):
