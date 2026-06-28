@@ -16,7 +16,7 @@ RATE_LIMIT_SKIP_TICKS = 1
 FACEOFF_TYPE = "faceoff"
 SHOT_TYPES = {"shot-on-goal", "goal"}
 
-st.set_page_config(page_title="NHL Markets Dev Tool", layout="wide")
+st.set_page_config(page_title="NHL Markets Live Tool", layout="wide")
 
 
 STATE_VERSION = 2
