@@ -1,5 +1,7 @@
+import csv
 import json
 import os
+import threading
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -91,8 +93,57 @@ class RateLimitedError(Exception):
     pass
 
 
+REQUEST_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nhl_request_logs")
+REQUEST_LOG_COLUMNS = ["time_et", "epoch", "url", "status", "elapsed_ms", "retry_after", "headers"]
+_request_log_lock = threading.Lock()
+
+
+def log_request(url: str, started: float, response=None, error: Exception | None = None):
+    # One CSV row per real network request (cache hits never reach here). Never breaks the fetch.
+    try:
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        if response is not None:
+            status = response.status_code
+            retry_after = response.headers.get("Retry-After", "")
+            # Full headers on 429 to see what the NHL tells us; otherwise just the rate/cache ones
+            headers = dict(response.headers) if status == 429 else {
+                k: v for k, v in response.headers.items()
+                if any(s in k.lower() for s in ("ratelimit", "retry", "cache", "age", "etag", "cf-", "x-amz"))
+            }
+        else:
+            status = f"ERR:{type(error).__name__}"
+            retry_after = ""
+            headers = {}
+        row = [
+            now_et.strftime("%Y-%m-%d %I:%M:%S.%f")[:-3] + now_et.strftime(" %p"),
+            f"{started:.3f}",
+            url,
+            status,
+            round((time.time() - started) * 1000),
+            retry_after,
+            json.dumps(headers),
+        ]
+        path = os.path.join(REQUEST_LOG_DIR, f"requests_{now_et.strftime('%Y-%m-%d')}.csv")
+        with _request_log_lock:
+            os.makedirs(REQUEST_LOG_DIR, exist_ok=True)
+            is_new = not os.path.exists(path)
+            with open(path, "a", newline="") as f:
+                writer = csv.writer(f)
+                if is_new:
+                    writer.writerow(REQUEST_LOG_COLUMNS)
+                writer.writerow(row)
+    except Exception:
+        pass
+
+
 def fetch_json(url: str) -> dict:
-    response = requests.get(url, timeout=10)
+    started = time.time()
+    try:
+        response = requests.get(url, timeout=10)
+    except requests.RequestException as e:
+        log_request(url, started, error=e)
+        raise
+    log_request(url, started, response=response)
     if response.status_code == 429:
         raise RateLimitedError("Rate limited by NHL API (429)")
     response.raise_for_status()
