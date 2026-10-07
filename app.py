@@ -791,6 +791,33 @@ with st.sidebar:
     if st.button(color_label, use_container_width=True):
         st.session_state.color_mode = not st.session_state.color_mode
 
+    st.divider()
+    # Only read the log file while this is ticked — it's re-read on every auto-refresh
+    if st.checkbox("Request log download", key="show_request_log_download"):
+        try:
+            log_files = sorted(
+                (f for f in os.listdir(REQUEST_LOG_DIR) if f.startswith("requests_") and f.endswith(".csv")),
+                reverse=True,
+            ) if os.path.isdir(REQUEST_LOG_DIR) else []
+        except Exception:
+            log_files = []
+        if not log_files:
+            st.caption("No request log yet — it starts with the first NHL request.")
+        else:
+            log_file = st.selectbox("Log date", options=log_files, key="request_log_file")
+            try:
+                with open(os.path.join(REQUEST_LOG_DIR, log_file), "rb") as f:
+                    log_bytes = f.read()
+                st.download_button(
+                    f"Download {log_file} ({len(log_bytes) / 1_000_000:.1f} MB)",
+                    data=log_bytes,
+                    file_name=log_file,
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.caption(f"Couldn't read log: {e}")
+
 # Main area
 if st.session_state.tracking:
     st_autorefresh(interval=REFRESH_MS, key="market_dev_refresh")
